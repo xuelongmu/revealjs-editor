@@ -83,6 +83,10 @@ type EditorKeyboardEvent = {
   shiftKey: boolean;
   preventDefault: () => void;
   stopPropagation: () => void;
+  stopImmediatePropagation?: () => void;
+  nativeEvent?: {
+    stopImmediatePropagation?: () => void;
+  };
 };
 type TextStyleOption = {
   value: string;
@@ -112,6 +116,15 @@ function readStoredSlideIndex(deckId: string, slideCount?: number) {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+function stopEditorKeyboardEvent(event: KeyboardEvent | EditorKeyboardEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation?.();
+  if ("nativeEvent" in event) {
+    event.nativeEvent?.stopImmediatePropagation?.();
   }
 }
 
@@ -590,8 +603,7 @@ export function App() {
   const handleEditorKeyDown = useCallback(
     (event: KeyboardEvent | EditorKeyboardEvent) => {
       if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
+        stopEditorKeyboardEvent(event);
         const blockId = selectedBlockIdRef.current;
         const sourceText = selectedBlockSourceTextRef.current;
         if (blockId) {
@@ -620,8 +632,7 @@ export function App() {
           return;
         }
 
-        event.preventDefault();
-        event.stopPropagation();
+        stopEditorKeyboardEvent(event);
         if (isUndo) undoDraftEdit();
         if (isRedo) redoDraftEdit();
       }
@@ -1356,7 +1367,15 @@ export function App() {
       handlePersistedHistoryKeyDown(event);
     };
 
+    const onEditorShortcutKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && selectedBlockIdRef.current) {
+        handleEditorKeyDown(event);
+      }
+    };
+
     doc.addEventListener("mousedown", onMouseDown);
+    win.addEventListener("keydown", onEditorShortcutKeyDown, true);
+    doc.addEventListener("keydown", onEditorShortcutKeyDown, true);
     doc.addEventListener("keydown", onKeyDown);
 
     const storedSlideIndex = selectedDeckId
@@ -1420,6 +1439,7 @@ export function App() {
     activateInlineEditable,
     autoApplyActiveEdit,
     clearActiveEdit,
+    handleEditorKeyDown,
     handlePersistedHistoryKeyDown,
     manifest,
     previewBlockText,
