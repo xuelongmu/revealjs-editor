@@ -42,7 +42,7 @@ The backend runs at:
 http://localhost:3030
 ```
 
-Use the workspace picker in the sidebar to select a local folder that contains RevealJS deck folders.
+Use the workspace picker in the sidebar to select either a local folder that contains RevealJS deck folders or a deck folder directly.
 
 ## Deck Shape
 
@@ -113,7 +113,7 @@ $env:DECK_ROOTS = "D:\path\to\deck-workspace"
 npm run dev
 ```
 
-Multiple roots can be separated with semicolons. The in-app picker switches to one selected workspace at a time.
+Multiple roots can be separated with semicolons. A root can be a parent workspace or a deck folder with its own `index.html`. The in-app picker switches to one selected workspace at a time.
 
 ## Documentation
 
