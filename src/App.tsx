@@ -1,4 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  AssistantRuntimeProvider,
+  ComposerPrimitive,
+  MessagePartPrimitive,
+  MessagePrimitive,
+  ThreadPrimitive,
+  useAuiState,
+  useExternalStoreRuntime,
+  type AppendMessage
+} from "@assistant-ui/react";
+import { isSafeLinkUrl, renderCopy } from "../shared/presentationMarkdown.mjs";
 
 type DeckSummary = {
   id: string;
@@ -43,17 +54,42 @@ type DeckManifest = {
   blocks: EditableBlock[];
 };
 
-type AgentJob = {
+type AgentChatMessage = {
   id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  createdAt: string;
+  status: "running" | "complete" | "failed";
+};
+
+type AgentPlanItem = {
+  step: string;
+  status: "pending" | "completed";
+};
+
+type AgentActivity = {
+  id: string;
+  type: string;
+  title: string;
+  detail: string;
+  status: string;
+  output?: string;
+  exitCode?: number | null;
+  changes?: { path: string; kind: string }[];
+};
+
+type AgentThread = {
+  id: string;
+  codexThreadId: string | null;
   deckId: string;
-  status: "running" | "completed" | "failed";
-  prompt: string;
+  status: "idle" | "running" | "completed" | "failed";
+  mode: "chat" | "plan";
   scope: Record<string, unknown>;
+  messages: AgentChatMessage[];
+  plan: AgentPlanItem[];
+  activities: AgentActivity[];
   createdAt: string;
   updatedAt: string;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
   validation: null | {
     skipped: boolean;
     ok: boolean;
@@ -81,6 +117,9 @@ type EditorKeyboardEvent = {
   ctrlKey: boolean;
   metaKey: boolean;
   shiftKey: boolean;
+  altKey?: boolean;
+  currentTarget?: EventTarget | null;
+  target?: EventTarget | null;
   preventDefault: () => void;
   stopPropagation: () => void;
   stopImmediatePropagation?: () => void;
@@ -101,6 +140,80 @@ type PersistedEdit = {
   beforeText: string;
   afterText: string;
 };
+
+function serializeEditableCopy(element: HTMLElement) {
+  if (!element.querySelector("li")) {
+    return (element.textContent || "").replace(/\u00a0/g, " ").replace(/\n$/, "");
+  }
+
+  const lines: string[] = [];
+  element.childNodes.forEach((node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = (node.textContent || "").replace(/\u00a0/g, " ").trim();
+      if (text) lines.push(text);
+      return;
+    }
+
+    if (node.nodeType !== 1) return;
+    const element = node as Element;
+    const tagName = element.tagName.toLowerCase();
+    if (tagName === "ul" || tagName === "ol") {
+      Array.from(element.children).forEach((child, index) => {
+        if (child.tagName.toLowerCase() !== "li") return;
+        const marker = tagName === "ol" ? `${index + 1}. ` : "- ";
+        lines.push(`${marker}${(child.textContent || "").replace(/\u00a0/g, " ").trim()}`);
+      });
+      return;
+    }
+
+    if (tagName === "br") {
+      lines.push("");
+      return;
+    }
+
+    const text = (element.textContent || "").replace(/\u00a0/g, " ").trim();
+    if (text) lines.push(text);
+  });
+
+  return lines.join("\n");
+}
+
+function stripListMarker(line: string) {
+  return line.replace(/^(\s*)(?:[-*+]|\d+[.)])\s+/, "$1");
+}
+
+function applyLinePrefix(source: string, start: number, end: number, kind: "bullet" | "numbered") {
+  const lineStart = source.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+  const nextLineBreak = source.indexOf("\n", end);
+  const lineEnd = nextLineBreak === -1 ? source.length : nextLineBreak;
+  const selectedLines = source.slice(lineStart, lineEnd).split("\n");
+  const markerPattern = kind === "bullet" ? /^(\s*)[-*+]\s+/ : /^(\s*)\d+[.)]\s+/;
+  const active = selectedLines.some((line) => line.trim()) && selectedLines.every((line) => !line.trim() || markerPattern.test(line));
+
+  let number = 1;
+  const replacement = selectedLines
+    .map((line) => {
+      if (!line.trim()) return line;
+      if (active) return line.replace(markerPattern, "$1");
+
+      const withoutMarker = stripListMarker(line);
+      const indent = withoutMarker.match(/^\s*/)?.[0] ?? "";
+      const content = withoutMarker.slice(indent.length);
+      if (kind === "numbered") {
+        const current = number;
+        number += 1;
+        return `${indent}${current}. ${content}`;
+      }
+      return `${indent}- ${content}`;
+    })
+    .join("\n");
+
+  return {
+    nextText: `${source.slice(0, lineStart)}${replacement}${source.slice(lineEnd)}`,
+    selectionStart: lineStart,
+    selectionEnd: lineStart + replacement.length
+  };
+}
 
 const slideIndexStoragePrefix = "revealjs-local-editor:last-slide:";
 const recentWorkspaceStorageKey = "revealjs-local-editor:recent-workspaces";
@@ -126,6 +239,20 @@ function stopEditorKeyboardEvent(event: KeyboardEvent | EditorKeyboardEvent) {
   if ("nativeEvent" in event) {
     event.nativeEvent?.stopImmediatePropagation?.();
   }
+}
+
+function isRevealOverviewActive(doc: Document) {
+  return Boolean(doc.querySelector(".reveal.overview"));
+}
+
+function EyeIcon({ hidden }: { hidden: boolean }) {
+  return (
+    <svg aria-hidden="true" className="button-icon" viewBox="0 0 24 24">
+      <path d="M2.8 12s3.4-6 9.2-6 9.2 6 9.2 6-3.4 6-9.2 6-9.2-6-9.2-6Z" />
+      <circle cx="12" cy="12" r="2.8" />
+      {hidden && <path d="M4 4l16 16" />}
+    </svg>
+  );
 }
 
 function writeStoredSlideIndex(deckId: string, slideIndex: number) {
@@ -167,79 +294,6 @@ function addRecentWorkspace(pathValue: string) {
   return recent;
 }
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function isSafeLinkUrl(value: string) {
-  try {
-    const url = new URL(value);
-    return ["http:", "https:", "mailto:"].includes(url.protocol);
-  } catch {
-    return false;
-  }
-}
-
-function renderInlineMarkup(value: string): string {
-  let rendered = "";
-  let index = 0;
-
-  while (index < value.length) {
-    if (value.startsWith("**", index)) {
-      const endIndex = value.indexOf("**", index + 2);
-      if (endIndex > index + 2) {
-        rendered += `<strong>${renderInlineMarkup(value.slice(index + 2, endIndex))}</strong>`;
-        index = endIndex + 2;
-        continue;
-      }
-    }
-
-    if (value[index] === "*") {
-      const endIndex = value.indexOf("*", index + 1);
-      if (endIndex > index + 1) {
-        rendered += `<em>${renderInlineMarkup(value.slice(index + 1, endIndex))}</em>`;
-        index = endIndex + 1;
-        continue;
-      }
-    }
-
-    if (value[index] === "[") {
-      const labelEnd = value.indexOf("](", index + 1);
-      const hrefEnd = labelEnd === -1 ? -1 : value.indexOf(")", labelEnd + 2);
-      if (labelEnd > index + 1 && hrefEnd > labelEnd + 2) {
-        const label = value.slice(index + 1, labelEnd);
-        const href = value.slice(labelEnd + 2, hrefEnd);
-        if (isSafeLinkUrl(href)) {
-          const target = href.startsWith("mailto:") ? "" : " target=\"_blank\" rel=\"noopener\"";
-          rendered += `<a class="copy-link" href="${escapeHtml(href)}"${target}>${renderInlineMarkup(label)}</a>`;
-        } else {
-          rendered += escapeHtml(value.slice(index, hrefEnd + 1));
-        }
-        index = hrefEnd + 1;
-        continue;
-      }
-    }
-
-    const nextSpecial = ["**", "*", "["]
-      .map((token) => value.indexOf(token, index + 1))
-      .filter((candidate) => candidate !== -1)
-      .sort((left, right) => left - right)[0];
-    const endIndex = nextSpecial ?? value.length;
-    rendered += escapeHtml(value.slice(index, endIndex));
-    index = endIndex;
-  }
-
-  return rendered;
-}
-
-function renderCopyMarkup(value: string) {
-  return value.split(/\r?\n/).map(renderInlineMarkup).join("<br>");
-}
-
 function textStyleKey(style: EditableBlock["textStyle"] | Pick<TextStyleOption, "tagName" | "className"> | null) {
   if (!style) return "";
   return `${style.tagName}|${style.className}`;
@@ -256,17 +310,200 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+function getAppendMessageText(message: AppendMessage) {
+  const content = message.content as unknown;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part) {
+        return String(part.text || "");
+      }
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+function AgentTextPart({ text }: { text: string }) {
+  return <p className="agent-message-text">{text}</p>;
+}
+
+function AgentMessageRow() {
+  const role = useAuiState((state) => state.message.role);
+  return (
+    <MessagePrimitive.Root className={`agent-message ${role}`}>
+      <div className="agent-message-role">{role === "user" ? "You" : "Codex"}</div>
+      <MessagePrimitive.Parts components={{ Text: AgentTextPart }} />
+    </MessagePrimitive.Root>
+  );
+}
+
+type AgentAssistantRuntimeProps = {
+  agentMode: "chat" | "plan";
+  agentThread: AgentThread | null;
+  onModeChange: (mode: "chat" | "plan") => void;
+  onSubmit: (prompt: string) => Promise<void>;
+  selectedDeckId: string;
+};
+
+type AgentAssistantBoundaryState = {
+  error: string | null;
+};
+
+class AgentAssistantBoundary extends Component<{ children: ReactNode }, AgentAssistantBoundaryState> {
+  state: AgentAssistantBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: unknown): AgentAssistantBoundaryState {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="agent-runtime-fallback">
+          <strong>Assistant UI failed to render.</strong>
+          <p>{this.state.error}</p>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+function AgentAssistantRuntime({
+  agentMode,
+  agentThread,
+  onModeChange,
+  onSubmit,
+  selectedDeckId
+}: AgentAssistantRuntimeProps) {
+  const assistantRuntime = useExternalStoreRuntime<AgentChatMessage>({
+    messages: agentThread?.messages ?? [],
+    isRunning: agentThread?.status === "running",
+    isSendDisabled: !selectedDeckId || agentThread?.status === "running",
+    onNew: async (message) => {
+      const text = getAppendMessageText(message);
+      if (text) await onSubmit(text);
+    },
+    convertMessage: (message) => {
+      const converted = {
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        createdAt: new Date(message.createdAt)
+      };
+      if (message.role !== "assistant") return converted;
+
+      return {
+        ...converted,
+        status:
+          message.status === "running"
+            ? { type: "running" as const }
+            : message.status === "failed"
+              ? { type: "incomplete" as const, reason: "error" as const }
+              : { type: "complete" as const, reason: "stop" as const }
+      };
+    }
+  });
+
+  return (
+    <>
+      <div className="agent-mode-toggle" role="group" aria-label="Agent mode">
+        <button className={agentMode === "chat" ? "active" : ""} type="button" onClick={() => onModeChange("chat")}>
+          Chat
+        </button>
+        <button className={agentMode === "plan" ? "active" : ""} type="button" onClick={() => onModeChange("plan")}>
+          Plan
+        </button>
+      </div>
+
+      <AssistantRuntimeProvider runtime={assistantRuntime}>
+        <ThreadPrimitive.Root className="agent-thread">
+          <ThreadPrimitive.Viewport className="agent-thread-viewport">
+            <ThreadPrimitive.Empty>
+              <div className="agent-empty">
+                Ask Codex to revise the current slide, inspect copy blocks, or draft a plan.
+              </div>
+            </ThreadPrimitive.Empty>
+            <ThreadPrimitive.Messages>{() => <AgentMessageRow />}</ThreadPrimitive.Messages>
+
+            {Boolean(agentThread?.plan.length) && (
+              <div className="agent-plan">
+                <div className="agent-panel-title">Plan</div>
+                {agentThread?.plan.map((item, index) => (
+                  <div className={`agent-plan-item ${item.status}`} key={`${item.step}-${index}`}>
+                    <span>{item.status === "completed" ? "done" : "next"}</span>
+                    <p>{item.step}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {Boolean(agentThread?.activities.length) && (
+              <div className="agent-activity">
+                <div className="agent-panel-title">Activity</div>
+                {agentThread?.activities.map((activity) => (
+                  <details key={activity.id} className={`agent-activity-item ${activity.status}`}>
+                    <summary>
+                      <span>{activity.title}</span>
+                      <small>{activity.status}</small>
+                    </summary>
+                    {activity.detail && <pre>{activity.detail}</pre>}
+                    {activity.output && <pre>{activity.output.slice(-3000)}</pre>}
+                  </details>
+                ))}
+              </div>
+            )}
+
+            {agentThread?.validation && (
+              <div className={agentThread.validation.ok ? "validation ok" : "validation failed"}>
+                Validation {agentThread.validation.skipped ? "skipped" : agentThread.validation.ok ? "passed" : "failed"}
+              </div>
+            )}
+
+            {agentThread?.diff && (
+              <details className="agent-diff">
+                <summary>Changes</summary>
+                <pre>{agentThread.diff.slice(0, 8000)}</pre>
+              </details>
+            )}
+          </ThreadPrimitive.Viewport>
+
+          <ThreadPrimitive.ViewportFooter className="agent-composer-footer">
+            <ComposerPrimitive.Root className="agent-composer">
+              <ComposerPrimitive.Input
+                className="agent-composer-input"
+                disabled={!selectedDeckId}
+                placeholder={agentMode === "plan" ? "Ask for a plan for this slide..." : "Ask Codex to edit this deck..."}
+                submitMode="ctrlEnter"
+                rows={4}
+              />
+              <div className="agent-composer-actions">
+                <span>Ctrl+Enter</span>
+                <ComposerPrimitive.Send className="primary" disabled={!selectedDeckId}>
+                  Send
+                </ComposerPrimitive.Send>
+              </div>
+            </ComposerPrimitive.Root>
+          </ThreadPrimitive.ViewportFooter>
+        </ThreadPrimitive.Root>
+      </AssistantRuntimeProvider>
+    </>
+  );
+}
+
 export function App() {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const [decks, setDecks] = useState<DeckSummary[]>([]);
-  const [deckRoots, setDeckRoots] = useState<string[]>([]);
   const [workspacePath, setWorkspacePath] = useState("");
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>(() => readRecentWorkspaces());
   const [workspaceDraft, setWorkspaceDraft] = useState("");
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [selectedDeckId, setSelectedDeckId] = useState<string>("");
   const [manifest, setManifest] = useState<DeckManifest | null>(null);
-  const [editMode, setEditMode] = useState(false);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [draftText, setDraftText] = useState("");
   const [status, setStatus] = useState("Loading decks...");
@@ -274,12 +511,14 @@ export function App() {
   const [reloadKey, setReloadKey] = useState(0);
   const [restorePoint, setRestorePoint] = useState<RestorePoint>(null);
   const [currentSlideIndex, setCurrentSlideIndex] = useState<number | null>(null);
-  const [promptOpen, setPromptOpen] = useState(false);
-  const [promptText, setPromptText] = useState("");
-  const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
+  const [agentThread, setAgentThread] = useState<AgentThread | null>(null);
+  const [agentMode, setAgentMode] = useState<"chat" | "plan">("chat");
+  const [agentDrawerOpen, setAgentDrawerOpen] = useState(false);
   const [textStyleOptions, setTextStyleOptions] = useState<TextStyleOption[]>([]);
   const [linkUrl, setLinkUrl] = useState("");
   const [pendingPreviewRefresh, setPendingPreviewRefresh] = useState(false);
+  const [draggedSlideId, setDraggedSlideId] = useState<string | null>(null);
+  const [dragOverSlideId, setDragOverSlideId] = useState<string | null>(null);
   const draftTextRef = useRef("");
   const hasUnsavedDraftRef = useRef(false);
   const selectedDeckIdRef = useRef("");
@@ -297,12 +536,19 @@ export function App() {
   const persistedHistoryKeyDownHandlerRef = useRef<((event: KeyboardEvent | EditorKeyboardEvent) => void) | null>(null);
   const pendingCaretPointRef = useRef<CaretPoint>(null);
   const currentSlideIndexRef = useRef<number | null>(null);
+  const slideListItemsRef = useRef<HTMLDivElement | null>(null);
+  const activeSlideItemRef = useRef<HTMLDivElement | null>(null);
+  const draggedSlideIdRef = useRef<string | null>(null);
   const fileRefreshTimerRef = useRef<number | null>(null);
   const autoApplyKeyRef = useRef<string | null>(null);
   const autoApplyPromiseRef = useRef<Promise<void> | null>(null);
   const ignoreOwnFileRefreshUntilRef = useRef(0);
+  const agentThreadIdRef = useRef<string | null>(null);
 
   const clearActiveEdit = useCallback(() => {
+    selectedBlockIdRef.current = null;
+    selectedBlockSourceTextRef.current = "";
+    previousSelectedBlockIdRef.current = null;
     setSelectedBlockId(null);
   }, []);
 
@@ -367,6 +613,21 @@ export function App() {
   const hasUnsavedDraft = Boolean(selectedBlock && draftText !== selectedBlockSourceTextRef.current);
 
   useEffect(() => {
+    const list = slideListItemsRef.current;
+    const activeItem = activeSlideItemRef.current;
+    if (!list || !activeItem) return;
+
+    const listRect = list.getBoundingClientRect();
+    const itemRect = activeItem.getBoundingClientRect();
+    const isAboveView = itemRect.top < listRect.top;
+    const isBelowView = itemRect.bottom > listRect.bottom;
+
+    if (isAboveView || isBelowView) {
+      activeItem.scrollIntoView({ block: "nearest" });
+    }
+  }, [currentSlideIndex, manifest]);
+
+  useEffect(() => {
     selectedDeckIdRef.current = selectedDeckId;
   }, [selectedDeckId]);
 
@@ -418,7 +679,7 @@ export function App() {
 
   const handleInlineInput = useCallback((event: Event) => {
     const element = event.currentTarget as HTMLElement;
-    const nextText = (element.textContent || "").replace(/\u00a0/g, " ").replace(/\n$/, "");
+    const nextText = serializeEditableCopy(element);
     recordDraftHistory(nextText);
     draftTextRef.current = nextText;
     setDraftText(nextText);
@@ -447,7 +708,7 @@ export function App() {
   const previewBlockText = useCallback(
     (blockId: string, text: string) => {
       if (selectedBlockId === blockId && editableElementRef.current) {
-        editableElementRef.current.innerHTML = renderCopyMarkup(text);
+        editableElementRef.current.innerHTML = renderCopy(text);
         return;
       }
 
@@ -465,7 +726,7 @@ export function App() {
       }
 
       const wrapper = doc.createElement("span");
-      wrapper.innerHTML = renderCopyMarkup(text);
+      wrapper.innerHTML = renderCopy(text);
       while (wrapper.firstChild) {
         start.parentNode?.insertBefore(wrapper.firstChild, end);
       }
@@ -600,6 +861,54 @@ export function App() {
     applyHistoryText(nextText);
   }, [applyHistoryText]);
 
+  const handleTextareaListEnter = useCallback(
+    (event: KeyboardEvent | EditorKeyboardEvent) => {
+      const target = "currentTarget" in event ? event.currentTarget : null;
+      const textarea = textareaRef.current;
+      if (!textarea || target !== textarea) return false;
+      if (event.key !== "Enter" || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return false;
+      if (textarea.selectionStart !== textarea.selectionEnd) return false;
+
+      const start = textarea.selectionStart;
+      const lineStart = draftTextRef.current.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+      const nextLineBreak = draftTextRef.current.indexOf("\n", start);
+      const lineEnd = nextLineBreak === -1 ? draftTextRef.current.length : nextLineBreak;
+      const lineUntilCursor = draftTextRef.current.slice(lineStart, start);
+      const lineAfterCursor = draftTextRef.current.slice(start, lineEnd);
+      if (lineAfterCursor.trim()) return false;
+
+      const emptyBullet = lineUntilCursor.match(/^(\s*)[-*+]\s*$/);
+      const emptyNumbered = lineUntilCursor.match(/^(\s*)\d+[.)]\s*$/);
+      if (emptyBullet || emptyNumbered) {
+        stopEditorKeyboardEvent(event);
+        const indent = emptyBullet?.[1] ?? emptyNumbered?.[1] ?? "";
+        const nextText = `${draftTextRef.current.slice(0, lineStart)}${indent}${draftTextRef.current.slice(start)}`;
+        updateDraftText(nextText);
+        window.requestAnimationFrame(() => {
+          textareaRef.current?.focus();
+          textareaRef.current?.setSelectionRange(lineStart + indent.length, lineStart + indent.length);
+        });
+        return true;
+      }
+
+      const bullet = lineUntilCursor.match(/^(\s*)[-*+]\s+/);
+      const numbered = lineUntilCursor.match(/^(\s*)(\d+)([.)])\s+/);
+      if (!bullet && !numbered) return false;
+
+      stopEditorKeyboardEvent(event);
+      const marker = numbered ? `${numbered[1]}${Number(numbered[2]) + 1}${numbered[3]} ` : `${bullet?.[1] ?? ""}- `;
+      const nextText = `${draftTextRef.current.slice(0, start)}\n${marker}${draftTextRef.current.slice(start)}`;
+      updateDraftText(nextText);
+      const caret = start + marker.length + 1;
+      window.requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(caret, caret);
+      });
+      return true;
+    },
+    [updateDraftText]
+  );
+
   const handleEditorKeyDown = useCallback(
     (event: KeyboardEvent | EditorKeyboardEvent) => {
       if (event.key === "Escape") {
@@ -616,6 +925,8 @@ export function App() {
         clearActiveEdit();
         return;
       }
+
+      if (handleTextareaListEnter(event)) return;
 
       const isUndo = (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z";
       const isRedo =
@@ -637,7 +948,7 @@ export function App() {
         if (isRedo) redoDraftEdit();
       }
     },
-    [clearActiveEdit, previewBlockText, redoDraftEdit, resetDraftHistory, undoDraftEdit]
+    [clearActiveEdit, handleTextareaListEnter, previewBlockText, redoDraftEdit, resetDraftHistory, undoDraftEdit]
   );
 
   useEffect(() => {
@@ -647,7 +958,7 @@ export function App() {
   const loadDecks = useCallback(async () => {
     try {
       const payload = await requestJson<DecksPayload>("/api/decks");
-      setDeckRoots(payload.deckRoots);
+      setError(null);
       setDecks(payload.decks);
       setWorkspacePath(payload.deckRoots[0] || "");
       setWorkspaceDraft(payload.deckRoots[0] || "");
@@ -655,6 +966,7 @@ export function App() {
 
       const nextDeck =
         payload.decks.find((deck) => deck.id === selectedDeckIdRef.current) ?? payload.decks[0] ?? null;
+      selectedDeckIdRef.current = nextDeck?.id ?? "";
       setSelectedDeckId(nextDeck?.id ?? "");
       if (!nextDeck) {
         setManifest(null);
@@ -668,13 +980,14 @@ export function App() {
   }, []);
 
   const applyWorkspacePayload = useCallback((payload: DecksPayload, statusMessage?: string) => {
-    setDeckRoots(payload.deckRoots);
+    setError(null);
     setDecks(payload.decks);
     setWorkspacePath(payload.deckRoots[0] || "");
     setWorkspaceDraft(payload.deckRoots[0] || "");
     if (payload.deckRoots[0]) setRecentWorkspaces(addRecentWorkspace(payload.deckRoots[0]));
 
     const nextDeck = payload.decks[0] ?? null;
+    selectedDeckIdRef.current = nextDeck?.id ?? "";
     setSelectedDeckId(nextDeck?.id ?? "");
     setManifest(null);
     clearActiveEdit();
@@ -736,6 +1049,8 @@ export function App() {
     try {
       setStatus("Reading deck manifest...");
       const nextManifest = await requestJson<DeckManifest>(`/api/decks/${deckId}/manifest`);
+      if (deckId !== selectedDeckIdRef.current) return;
+      setError(null);
       const storedSlideIndex = readStoredSlideIndex(deckId, nextManifest.slides.length);
       setManifest(nextManifest);
       setSelectedBlockId(null);
@@ -753,6 +1068,7 @@ export function App() {
         `Loaded ${nextManifest.slides.length} slides and ${nextManifest.blocks.length} editable blocks.`
       );
     } catch (caught) {
+      if (deckId !== selectedDeckIdRef.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
     }
   }, [resetDraftHistory, resetPersistedHistory]);
@@ -867,12 +1183,6 @@ export function App() {
   }, [selectedBlockId]);
 
   useEffect(() => {
-    if (!editMode) {
-      clearActiveEdit();
-    }
-  }, [clearActiveEdit, editMode]);
-
-  useEffect(() => {
     if (!selectedBlock) return;
 
     const isNewSelection = previousSelectedBlockIdRef.current !== selectedBlock.id;
@@ -903,34 +1213,49 @@ export function App() {
   }, [activateInlineEditable, cleanupInlineEditable, selectedBlockId]);
 
   useEffect(() => {
-    if (!agentJob || !["running"].includes(agentJob.status)) return;
+    if (pendingPreviewRefresh && !selectedBlockId && !hasUnsavedDraft) {
+      reloadPreviewPreservingState("Preview refreshed with latest deck changes.");
+    }
+  }, [hasUnsavedDraft, pendingPreviewRefresh, reloadPreviewPreservingState, selectedBlockId]);
 
-    const timer = window.setInterval(async () => {
-      try {
-        const payload = await requestJson<{ job: AgentJob }>(`/api/agent-jobs/${agentJob.id}`);
-        setAgentJob(payload.job);
-        if (payload.job.status === "completed") {
-          setStatus("Agent job completed.");
-          if (selectedDeckId) {
-            await refreshManifestInPlace(selectedDeckId);
-            if (selectedBlockIdRef.current) {
-              setPendingPreviewRefresh(true);
-              setStatus("Agent job completed. Preview refresh is paused while this block is selected.");
-            } else {
-              reloadPreviewPreservingState("Agent job completed. Refreshed preview.");
-            }
+  useEffect(() => {
+    setAgentThread(null);
+    agentThreadIdRef.current = null;
+  }, [selectedDeckId]);
+
+  useEffect(() => {
+    if (!agentThread?.id) return;
+    const source = new EventSource(`/api/agent-threads/${agentThread.id}/events`);
+
+    const handleThreadEvent = async (event: MessageEvent) => {
+      const payload = JSON.parse(event.data || "{}") as AgentThread;
+      setAgentThread(payload);
+      if (event.type === "agent-thread-completed") {
+        setStatus("Agent turn completed.");
+        if (selectedDeckId) {
+          await refreshManifestInPlace(selectedDeckId);
+          if (selectedBlockIdRef.current) {
+            setPendingPreviewRefresh(true);
+            setStatus("Agent turn completed. Preview refresh is paused while this block is selected.");
+          } else {
+            reloadPreviewPreservingState("Agent turn completed. Refreshed preview.");
           }
         }
-        if (payload.job.status === "failed") {
-          setStatus("Agent job failed. Check the job output.");
-        }
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught));
       }
-    }, 2000);
+      if (event.type === "agent-thread-failed") {
+        setStatus("Agent turn failed. Check the chat output.");
+      }
+    };
 
-    return () => window.clearInterval(timer);
-  }, [agentJob, refreshManifestInPlace, reloadPreviewPreservingState, selectedDeckId]);
+    source.addEventListener("agent-thread", handleThreadEvent);
+    source.addEventListener("agent-thread-completed", handleThreadEvent);
+    source.addEventListener("agent-thread-failed", handleThreadEvent);
+    source.onerror = () => {
+      setStatus("Agent event stream disconnected.");
+    };
+
+    return () => source.close();
+  }, [agentThread?.id, refreshManifestInPlace, reloadPreviewPreservingState, selectedDeckId]);
 
   const selectBlock = useCallback(
     (blockId: string) => {
@@ -1018,6 +1343,8 @@ export function App() {
     const priorLayer = doc.getElementById("reveal-local-editor-overlay");
     priorLayer?.remove();
 
+    if (isRevealOverviewActive(doc)) return;
+
     const priorStyle = doc.getElementById("reveal-local-editor-style");
     if (!priorStyle) {
       const style = doc.createElement("style");
@@ -1038,11 +1365,6 @@ export function App() {
           pointer-events: auto;
           position: fixed;
         }
-        .reveal-local-editor-hit[data-edit-mode="true"] {
-          background: rgba(0, 255, 255, 0.07);
-          border-color: rgba(0, 255, 255, 0.82);
-          box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.72);
-        }
         .reveal-local-editor-hit:hover {
           background: rgba(216, 255, 50, 0.11);
           border-color: rgba(216, 255, 50, 0.92);
@@ -1055,6 +1377,45 @@ export function App() {
         }
         .reveal-local-editor-hit[data-selected="true"] {
           pointer-events: none;
+        }
+        .reveal-local-editor-hidden-badge {
+          align-items: center;
+          background: #ff2f4a;
+          border: 2px solid #ffffff;
+          border-radius: 8px;
+          box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55), 0 0 0 4px rgba(255, 47, 74, 0.35);
+          color: #ffffff;
+          display: inline-flex;
+          font: 900 18px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+          gap: 10px;
+          letter-spacing: 0.12em;
+          padding: 12px 16px;
+          pointer-events: none;
+          position: fixed;
+          right: 24px;
+          text-transform: uppercase;
+          top: 24px;
+          z-index: 2147483647;
+        }
+        .reveal-local-editor-hidden-badge::before {
+          content: "!";
+          align-items: center;
+          background: #ffffff;
+          border-radius: 999px;
+          color: #ff2f4a;
+          display: inline-flex;
+          font: 900 18px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+          height: 24px;
+          justify-content: center;
+          width: 24px;
+        }
+        .reveal-local-editor-hidden-frame {
+          border: 6px solid rgba(255, 47, 74, 0.9);
+          box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.85), inset 0 0 80px rgba(255, 47, 74, 0.22);
+          inset: 0;
+          pointer-events: none;
+          position: fixed;
+          z-index: 2147483646;
         }
         .reveal-local-editor-tag {
           background: #050505;
@@ -1071,7 +1432,7 @@ export function App() {
           white-space: nowrap;
         }
         .reveal-local-editor-hit:hover .reveal-local-editor-tag,
-        .reveal-local-editor-hit[data-edit-mode="true"] .reveal-local-editor-tag {
+        .reveal-local-editor-hit[data-selected="true"] .reveal-local-editor-tag {
           opacity: 1;
         }
         .reveal-local-editor-active-text {
@@ -1095,6 +1456,27 @@ export function App() {
     const currentSlide =
       hiddenPreviewSlide ?? win?.Reveal?.getCurrentSlide?.() ?? doc.querySelector(".slides section.present");
     const searchRoot = currentSlide ?? doc.body;
+
+    const currentManifestSlide =
+      manifest.slides.find((slide) => slide.index === currentSlideIndexRef.current) ?? null;
+    const isHiddenSourceSlide =
+      Boolean(currentManifestSlide?.hidden) ||
+      (currentSlide instanceof HTMLElement &&
+        (currentSlide.getAttribute("data-editor-source-visibility") === "hidden" ||
+          currentSlide.getAttribute("data-visibility") === "hidden" ||
+          currentSlide.getAttribute("data-local-editor-hidden-preview") === "true" ||
+          currentSlide.getAttribute("data-local-editor-hidden-clone") === "true"));
+    if (isHiddenSourceSlide) {
+      const frame = doc.createElement("div");
+      frame.className = "reveal-local-editor-hidden-frame";
+      layer.appendChild(frame);
+
+      const badge = doc.createElement("div");
+      badge.className = "reveal-local-editor-hidden-badge";
+      badge.textContent = "Hidden slide";
+      layer.appendChild(badge);
+    }
+
     const comments: Comment[] = [];
     const walker = doc.createTreeWalker(searchRoot, NodeFilter.SHOW_COMMENT);
     let current = walker.nextNode();
@@ -1138,7 +1520,6 @@ export function App() {
       hit.type = "button";
       hit.className = "reveal-local-editor-hit";
       hit.dataset.blockId = blockId;
-      hit.dataset.editMode = String(editMode);
       hit.dataset.selected = String(blockId === selectedBlockId);
       hit.style.left = `${rect.left}px`;
       hit.style.top = `${rect.top}px`;
@@ -1155,14 +1536,13 @@ export function App() {
         event.preventDefault();
         event.stopPropagation();
         pendingCaretPointRef.current = { x: event.clientX, y: event.clientY };
-        if (!editMode) setEditMode(true);
         selectBlock(blockId);
       });
 
       layer.appendChild(hit);
     }
 
-  }, [editMode, manifest, selectBlock, selectedBlockId]);
+  }, [manifest, selectBlock, selectedBlockId]);
 
   const persistBlockText = useCallback(
     async (
@@ -1368,7 +1748,7 @@ export function App() {
     };
 
     const onEditorShortcutKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && selectedBlockIdRef.current) {
+      if (event.key === "Escape" && editableElementRef.current) {
         handleEditorKeyDown(event);
       }
     };
@@ -1417,6 +1797,20 @@ export function App() {
       if (indices) rememberSlideIndex(indices.h + 1);
     };
 
+    const handleOverviewShown = () => {
+      cleanupInlineEditable();
+      clearActiveEdit();
+      doc.getElementById("reveal-local-editor-overlay")?.remove();
+    };
+
+    const handleOverviewHidden = () => {
+      updateCurrentSlide();
+      window.setTimeout(() => {
+        refreshOverlay();
+        refreshTextStyleOptions();
+      }, 50);
+    };
+
     window.setTimeout(() => {
       updateCurrentSlide();
       refreshOverlay();
@@ -1434,11 +1828,14 @@ export function App() {
         refreshTextStyleOptions();
       }, 50);
     });
+    win.Reveal?.on?.("overviewshown", handleOverviewShown);
+    win.Reveal?.on?.("overviewhidden", handleOverviewHidden);
     win.addEventListener("resize", refreshOverlay);
   }, [
     activateInlineEditable,
     autoApplyActiveEdit,
     clearActiveEdit,
+    cleanupInlineEditable,
     handleEditorKeyDown,
     handlePersistedHistoryKeyDown,
     manifest,
@@ -1482,6 +1879,22 @@ export function App() {
       }
     },
     [replaceDraftSelection]
+  );
+
+  const applyLineFormat = useCallback(
+    (format: "bullet" | "numbered") => {
+      const textarea = textareaRef.current;
+      const start = textarea?.selectionStart ?? draftText.length;
+      const end = textarea?.selectionEnd ?? draftText.length;
+      const result = applyLinePrefix(draftText, start, end, format);
+      updateDraftText(result.nextText);
+
+      window.requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(result.selectionStart, result.selectionEnd);
+      });
+    },
+    [draftText, updateDraftText]
   );
 
   const applyLink = useCallback(() => {
@@ -1544,9 +1957,12 @@ export function App() {
   const applySlideMutation = useCallback(
     async (
       action: "duplicate" | "insert-after" | "visibility" | "move",
-      options: { direction?: "up" | "down"; hidden?: boolean } = {}
+      options: { direction?: "up" | "down"; hidden?: boolean; targetIndex?: number } = {},
+      slideId = currentSlide?.id
     ) => {
-      if (!selectedDeckId || !currentSlide) return;
+      if (!selectedDeckId || !slideId) return;
+      const sourceSlide = manifest?.slides.find((slide) => slide.id === slideId) ?? currentSlide;
+      if (!sourceSlide) return;
 
       try {
         const method = action === "visibility" ? "PUT" : "POST";
@@ -1554,12 +1970,12 @@ export function App() {
           action === "visibility"
             ? { hidden: options.hidden }
             : action === "move"
-              ? { direction: options.direction }
+              ? { direction: options.direction, targetIndex: options.targetIndex }
               : {};
 
-        setStatus(`Updating slide ${currentSlide.id}...`);
+        setStatus(`Updating slide ${sourceSlide.id}...`);
         const payload = await requestJson<{ manifest: DeckManifest; slideId?: string; moved?: boolean }>(
-          `/api/decks/${selectedDeckId}/slides/${encodeURIComponent(currentSlide.id)}/${action}`,
+          `/api/decks/${selectedDeckId}/slides/${encodeURIComponent(sourceSlide.id)}/${action}`,
           {
             method,
             headers: { "Content-Type": "application/json" },
@@ -1571,64 +1987,82 @@ export function App() {
         const targetSlide =
           payload.slideId
             ? payload.manifest.slides.find((slide) => slide.id === payload.slideId)
-            : payload.manifest.slides.find((slide) => slide.id === currentSlide.id);
-        const nextSlideIndex = targetSlide?.index ?? currentSlide.index;
+            : payload.manifest.slides.find((slide) => slide.id === sourceSlide.id);
+        const nextSlideIndex = targetSlide?.index ?? sourceSlide.index;
         currentSlideIndexRef.current = nextSlideIndex;
         setCurrentSlideIndex(nextSlideIndex);
         writeStoredSlideIndex(selectedDeckId, nextSlideIndex);
         setReloadKey((value) => value + 1);
-        setStatus(`Updated slide ${targetSlide?.id ?? currentSlide.id}.`);
+        setStatus(`Updated slide ${targetSlide?.id ?? sourceSlide.id}.`);
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
       }
     },
-    [currentSlide, selectedDeckId]
+    [currentSlide, manifest, selectedDeckId]
   );
 
-  const submitPrompt = async () => {
-    if (!selectedDeckId || !promptText.trim()) return;
-    try {
-      setStatus("Starting Codex agent job...");
-      const payload = await requestJson<{ job: AgentJob }>(`/api/decks/${selectedDeckId}/agent-jobs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: promptText,
-          scope: {
-            blockId: selectedBlockId,
-            slideId: selectedBlock?.slideId
-          }
-        })
-      });
-      setAgentJob(payload.job);
-      setStatus("Agent job running...");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    }
-  };
+  const submitAgentTurn = useCallback(
+    async (prompt: string) => {
+      if (!selectedDeckId || !prompt.trim()) return;
+      const scopedSlide = currentSlide ?? selectedSlide;
+      const scope = {
+        blockId: selectedBlockId,
+        slideId: scopedSlide?.id
+      };
+
+      try {
+        let thread = agentThread;
+        if (!thread || thread.deckId !== selectedDeckId) {
+          const created = await requestJson<{ thread: AgentThread }>(`/api/decks/${selectedDeckId}/agent-threads`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ scope, mode: agentMode })
+          });
+          thread = created.thread;
+          agentThreadIdRef.current = thread.id;
+          setAgentThread(thread);
+        }
+
+        setStatus(
+          scopedSlide
+            ? `Starting Codex turn with slide ${scopedSlide.index} (${scopedSlide.id}) as context...`
+            : "Starting Codex turn..."
+        );
+        const payload = await requestJson<{ thread: AgentThread }>(`/api/agent-threads/${thread.id}/turns`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt,
+            mode: agentMode,
+            scope
+          })
+        });
+        setAgentThread(payload.thread);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    },
+    [agentMode, agentThread, currentSlide, selectedBlockId, selectedDeckId, selectedSlide]
+  );
 
   return (
     <div
-      className="app-shell"
+      className={`app-shell ${agentDrawerOpen ? "agent-open" : "agent-collapsed"}`}
       onKeyDownCapture={handlePersistedHistoryKeyDown}
       onMouseDownCapture={(event) => {
         const target = event.target as HTMLElement | null;
-        if (!target || target.closest(".editor-card")) return;
+        if (!target || target.closest(".editor-card") || target.closest(".agent-drawer")) return;
         void autoApplyActiveEdit({ clearAfterSave: true });
       }}
     >
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-title">RevealJS Local Editor</div>
-          <div className="brand-subtitle">Local-only deck editing</div>
         </div>
 
         <section className="workspace-card" aria-label="Workspace">
           <div className="workspace-card-header">
             <span className="eyebrow">Workspace</span>
-            <button className="secondary compact-button" onClick={pickWorkspace} disabled={workspaceBusy}>
-              Browse
-            </button>
           </div>
           <form
             className="workspace-form"
@@ -1640,15 +2074,14 @@ export function App() {
             <input
               value={workspaceDraft}
               onChange={(event) => setWorkspaceDraft(event.target.value)}
-              placeholder="Path to folder containing deck folders"
+              placeholder="Paste workspace path or browse"
               aria-label="Workspace path"
               disabled={workspaceBusy}
             />
-            <button className="secondary compact-button" type="submit" disabled={workspaceBusy || !workspaceDraft.trim()}>
-              Open
+            <button className="secondary compact-button" type="button" onClick={pickWorkspace} disabled={workspaceBusy}>
+              Browse
             </button>
           </form>
-          {workspacePath && <code className="workspace-path">{workspacePath}</code>}
           {recentWorkspaces.length > 0 && (
             <div className="recent-workspaces">
               <span>Recent</span>
@@ -1673,6 +2106,8 @@ export function App() {
           <select
             value={selectedDeckId}
             onChange={(event) => {
+              setError(null);
+              selectedDeckIdRef.current = event.target.value;
               setSelectedDeckId(event.target.value);
               setReloadKey((value) => value + 1);
             }}
@@ -1687,116 +2122,94 @@ export function App() {
           </select>
         </label>
 
-        <section className="controls-pane" aria-label="Editor controls">
-          <div className="controls-pane-header">
-            <span className="eyebrow">Controls</span>
-            <span>No hotkeys</span>
-          </div>
-          <div className="control-grid">
-            <button className={editMode ? "primary active" : "primary"} onClick={() => setEditMode((value) => !value)}>
-              {editMode ? "Exit Edit Mode" : "Enter Edit Mode"}
-            </button>
-
-            <button className="secondary" onClick={() => setPromptOpen((value) => !value)}>
-              {promptOpen ? "Close Codex Pane" : "Ask Codex"}
-            </button>
-
-            <button
-              className="secondary"
-              onClick={() => void autoApplyActiveEdit({ clearAfterSave: true })}
-              disabled={!selectedBlockId}
-            >
-              Clear Selection
-            </button>
-
-            {pendingPreviewRefresh && (
-              <button
-                className="secondary pending-refresh"
-                onClick={() => reloadPreviewPreservingState("Preview refreshed with latest deck changes.")}
-                disabled={hasUnsavedDraft}
-                title={hasUnsavedDraft ? "Save or clear the current edit before refreshing the preview." : undefined}
-              >
-                Refresh Preview
-              </button>
-            )}
-          </div>
-        </section>
-
-        <div className="summary">
-          <div>{manifest?.slides.length ?? 0} slides</div>
-          <div>{manifest?.blocks.length ?? 0} editable blocks</div>
-          <div>{hiddenSlideCount} hidden slides</div>
-          <div>{manifest?.deck.hasCopyMd ? "copy.md enabled" : "HTML-only edits"}</div>
-        </div>
-
-        {currentSlide && (
-          <section className="controls-pane" aria-label="Slide structure">
-            <div className="controls-pane-header">
-              <span className="eyebrow">Slide Structure</span>
-              <span>{currentSlide.id}</span>
-            </div>
-            <div className="control-grid two-up">
-              <button className="secondary" type="button" onClick={() => void applySlideMutation("duplicate")}>
-                Duplicate
-              </button>
-              <button className="secondary" type="button" onClick={() => void applySlideMutation("insert-after")}>
-                Insert After
-              </button>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() => void applySlideMutation("visibility", { hidden: !currentSlide.hidden })}
-              >
-                {currentSlide.hidden ? "Show" : "Hide"}
-              </button>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() => void applySlideMutation("move", { direction: "up" })}
-                disabled={currentSlide.index <= 1}
-              >
-                Move Up
-              </button>
-              <button
-                className="secondary full-width"
-                type="button"
-                onClick={() => void applySlideMutation("move", { direction: "down" })}
-                disabled={Boolean(manifest && currentSlide.index >= manifest.slides.length)}
-              >
-                Move Down
-              </button>
-            </div>
-          </section>
-        )}
-
         {manifest && (
           <section className="slide-list" aria-label="Slides">
             <div className="slide-list-header">
               <span className="eyebrow">Slides</span>
-              <span>{manifest.slides.length}</span>
+              <span>
+                {manifest.slides.length} slides
+                {hiddenSlideCount > 0 ? ` (${hiddenSlideCount} hidden)` : ""}
+              </span>
             </div>
-            <div className="slide-list-items">
+            <div className="slide-list-items" ref={slideListItemsRef}>
               {manifest.slides.map((slide) => (
-                <button
+                <div
                   key={slide.id}
+                  ref={slide.index === currentSlideIndex ? activeSlideItemRef : null}
                   className={
-                    slide.index === currentSlideIndex
-                      ? "slide-list-item active"
-                      : "slide-list-item"
+                    [
+                      "slide-list-item",
+                      slide.index === currentSlideIndex ? "active" : "",
+                      slide.hidden ? "hidden" : "",
+                      draggedSlideId === slide.id ? "dragging" : "",
+                      dragOverSlideId === slide.id && draggedSlideId !== slide.id ? "drag-over" : ""
+                    ].filter(Boolean).join(" ")
                   }
-                  onClick={() => navigateToSlide(slide)}
-                  type="button"
+                  draggable
+                  onDragStart={(event) => {
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", slide.id);
+                    draggedSlideIdRef.current = slide.id;
+                    setDraggedSlideId(slide.id);
+                    setDragOverSlideId(null);
+                    navigateToSlide(slide);
+                  }}
+                  onDragEnter={() => {
+                    const sourceSlideId = draggedSlideIdRef.current;
+                    if (sourceSlideId && sourceSlideId !== slide.id) {
+                      setDragOverSlideId(slide.id);
+                    }
+                  }}
+                  onDragOver={(event) => {
+                    const sourceSlideId = draggedSlideIdRef.current;
+                    if (sourceSlideId && sourceSlideId !== slide.id) {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    const sourceSlideId = draggedSlideIdRef.current ?? event.dataTransfer.getData("text/plain");
+                    draggedSlideIdRef.current = null;
+                    setDraggedSlideId(null);
+                    setDragOverSlideId(null);
+                    if (sourceSlideId && sourceSlideId !== slide.id) {
+                      void applySlideMutation("move", { targetIndex: slide.index }, sourceSlideId);
+                    }
+                  }}
+                  onDragEnd={() => {
+                    draggedSlideIdRef.current = null;
+                    setDraggedSlideId(null);
+                    setDragOverSlideId(null);
+                  }}
                 >
-                  <span className="slide-list-index">{slide.index}</span>
-                  <span className="slide-list-copy">
-                    <strong>{getSlideLabel(slide)}</strong>
-                    <span>
-                      {slide.id}
-                      {slide.kind ? ` · ${slide.kind}` : ""}
+                  <span className="slide-drag-handle" aria-hidden="true" />
+                  <button
+                    className="slide-select-button"
+                    onClick={() => navigateToSlide(slide)}
+                    type="button"
+                  >
+                    <span className="slide-list-index">{slide.index}</span>
+                    <span className="slide-list-copy">
+                      <strong>{getSlideLabel(slide)}</strong>
+                      <span>
+                        {slide.id}
+                        {slide.kind ? ` · ${slide.kind}` : ""}
+                      </span>
                     </span>
-                  </span>
-                  {slide.hidden && <span className="slide-hidden-pill">Hidden</span>}
-                </button>
+                  </button>
+                  <div className="slide-row-actions">
+                    <button
+                      className="slide-action-button"
+                      type="button"
+                      onClick={() => void applySlideMutation("visibility", { hidden: !slide.hidden }, slide.id)}
+                      aria-label={slide.hidden ? `Show slide ${slide.index}` : `Hide slide ${slide.index}`}
+                      title={slide.hidden ? "Show slide" : "Hide slide"}
+                    >
+                      <EyeIcon hidden={slide.hidden} />
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           </section>
@@ -1842,6 +2255,12 @@ export function App() {
                 <button className="secondary" type="button" onClick={() => applyInlineFormat("italic")}>
                   Italic
                 </button>
+                <button className="secondary" type="button" onClick={() => applyLineFormat("bullet")}>
+                  Bullets
+                </button>
+                <button className="secondary" type="button" onClick={() => applyLineFormat("numbered")}>
+                  Numbered
+                </button>
               </div>
               <div className="link-controls">
                 <input
@@ -1854,7 +2273,7 @@ export function App() {
                   Link
                 </button>
               </div>
-              <p className="muted">Inline formatting saves as markdown in copy.md.</p>
+              <p className="muted">Formatting saves as presentation markdown. Enter continues list items; Enter on an empty item exits the list.</p>
             </div>
             <textarea
               ref={textareaRef}
@@ -1870,43 +2289,7 @@ export function App() {
           </div>
         )}
 
-        {promptOpen && (
-          <div className="editor-card">
-            <div className="eyebrow">Prompted Edit</div>
-            <textarea
-              value={promptText}
-              onChange={(event) => setPromptText(event.target.value)}
-              placeholder="Make this slide sharper for a sponsor audience."
-              rows={5}
-            />
-            <button className="primary" onClick={submitPrompt}>
-              Launch Agent
-            </button>
-            <p className="muted">Runs locally with Codex CLI and reports validation plus git diff.</p>
-            {agentJob && (
-              <div className="job-panel">
-                <div className="block-meta">
-                  Job {agentJob.id.slice(0, 8)} · {agentJob.status}
-                </div>
-                {agentJob.validation && (
-                  <div className={agentJob.validation.ok ? "validation ok" : "validation failed"}>
-                    Validation {agentJob.validation.ok ? "passed" : "failed"}
-                  </div>
-                )}
-                {agentJob.stdout && <pre>{agentJob.stdout.slice(-4000)}</pre>}
-                {agentJob.stderr && <pre className="stderr">{agentJob.stderr.slice(-4000)}</pre>}
-                {agentJob.diff && <pre className="diff">{agentJob.diff.slice(0, 8000)}</pre>}
-              </div>
-            )}
-          </div>
-        )}
-
         <div className="status">{error || status}</div>
-        <div className="roots">
-          {deckRoots.map((root) => (
-            <code key={root}>{root}</code>
-          ))}
-        </div>
       </aside>
 
       <main className="deck-stage">
@@ -1924,6 +2307,67 @@ export function App() {
           <div className="empty-state">No deck selected.</div>
         )}
       </main>
+
+      <aside className={`agent-drawer ${agentDrawerOpen ? "open" : "collapsed"}`} aria-label="Codex agent">
+        {!agentDrawerOpen && (
+          <button
+            className="agent-rail-button"
+            type="button"
+            onClick={() => setAgentDrawerOpen(true)}
+            aria-label="Open Codex agent"
+            title="Open Codex"
+          >
+            <span>Codex</span>
+            <small>{agentThread?.status ?? "idle"}</small>
+          </button>
+        )}
+
+        {agentDrawerOpen && (
+          <>
+        <div className="agent-header">
+          <div>
+            <div className="eyebrow">Codex</div>
+            <strong>{selectedDeckId || "No deck selected"}</strong>
+          </div>
+          <div className="agent-header-actions">
+            <span className={`agent-status ${agentThread?.status ?? "idle"}`}>
+              {agentThread?.status ?? "idle"}
+            </span>
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => setAgentDrawerOpen(false)}
+              aria-label="Collapse Codex agent"
+              title="Collapse Codex"
+            >
+              x
+            </button>
+          </div>
+        </div>
+
+        <div className="agent-context">
+          <span>Slide context</span>
+          <strong>
+            {currentSlide
+              ? `Slide ${currentSlide.index}: ${currentSlide.id}`
+              : selectedDeckId
+                ? "No slide selected"
+                : "Select a deck first"}
+          </strong>
+        </div>
+
+        <AgentAssistantBoundary>
+          <AgentAssistantRuntime
+            agentMode={agentMode}
+            agentThread={agentThread}
+            onModeChange={setAgentMode}
+            onSubmit={submitAgentTurn}
+            selectedDeckId={selectedDeckId}
+          />
+        </AgentAssistantBoundary>
+          </>
+        )}
+      </aside>
     </div>
   );
 }

@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import fs from "node:fs/promises";
@@ -7,6 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import express from "express";
+import { Codex } from "@openai/codex-sdk";
+import { escapeHtml, renderCopy } from "../shared/presentationMarkdown.mjs";
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -20,7 +21,8 @@ const defaultDeckRoot = path.join(process.cwd(), "fixtures", "decks");
 let deckRoots = await loadInitialDeckRoots();
 
 const blockPattern = /<!--\s*copy:([a-z0-9._-]+)\s*-->([\s\S]*?)<!--\s*\/copy\s*-->/gi;
-const jobs = new Map();
+const codex = new Codex();
+const agentThreads = new Map();
 const deckWatchers = new Map();
 
 app.use(express.json({ limit: "1mb" }));
@@ -84,6 +86,10 @@ function sendDeckEvent(client, eventName, payload) {
   client.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function quotePowerShellString(value) {
+  return `'${String(value || "").replace(/'/g, "''")}'`;
+}
+
 function closeDeckWatchers() {
   for (const state of deckWatchers.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
@@ -124,23 +130,48 @@ async function setDeckRoots(nextRoots) {
 }
 
 async function pickWorkspaceDirectory() {
+  const initialDirectory = deckRoots[0] || process.cwd();
   const script = [
-    "Add-Type -AssemblyName System.Windows.Forms",
-    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
-    "$dialog.Description = 'Select a RevealJS deck workspace'",
-    "$dialog.ShowNewFolderButton = $false",
-    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"
-  ].join("; ");
+    "Add-Type -AssemblyName PresentationFramework",
+    "$dialog = [Microsoft.Win32.OpenFolderDialog]::new()",
+    "$dialog.Title = 'Select a RevealJS deck workspace'",
+    `$dialog.InitialDirectory = ${quotePowerShellString(initialDirectory)}`,
+    "if ($dialog.ShowDialog()) {",
+    "  [Console]::Out.Write($dialog.FolderName)",
+    "}"
+  ].join("\n");
 
-  const result = await execFileAsync(
-    "powershell",
-    ["-NoProfile", "-STA", "-Command", script],
-    {
-      cwd: process.cwd(),
-      windowsHide: false,
-      timeout: 1000 * 60 * 10
-    }
-  );
+  let result;
+  try {
+    result = await execFileAsync(
+      "pwsh",
+      ["-NoProfile", "-STA", "-Command", script],
+      {
+        cwd: process.cwd(),
+        windowsHide: false,
+        timeout: 1000 * 60 * 10
+      }
+    );
+  } catch (error) {
+    const fallbackScript = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+      "$dialog.Description = 'Select a RevealJS deck workspace'",
+      "$dialog.ShowNewFolderButton = $false",
+      `if ([System.IO.Directory]::Exists(${quotePowerShellString(initialDirectory)})) { $dialog.SelectedPath = ${quotePowerShellString(initialDirectory)} }`,
+      "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"
+    ].join("\n");
+
+    result = await execFileAsync(
+      "powershell",
+      ["-NoProfile", "-STA", "-Command", fallbackScript],
+      {
+        cwd: process.cwd(),
+        windowsHide: false,
+        timeout: 1000 * 60 * 10
+      }
+    );
+  }
 
   return result.stdout.trim();
 }
@@ -239,88 +270,6 @@ function decodeHtml(value) {
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&")
     .trim();
-}
-
-function escapeHtml(value) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function isSafeLinkUrl(value) {
-  try {
-    const url = new URL(value);
-    return ["http:", "https:", "mailto:"].includes(url.protocol);
-  } catch {
-    return false;
-  }
-}
-
-function findClosingParen(value, startIndex) {
-  for (let index = startIndex; index < value.length; index += 1) {
-    if (value[index] === ")") return index;
-  }
-  return -1;
-}
-
-function renderInline(value) {
-  let rendered = "";
-  let index = 0;
-
-  while (index < value.length) {
-    if (value.startsWith("**", index)) {
-      const endIndex = value.indexOf("**", index + 2);
-      if (endIndex > index + 2) {
-        rendered += `<strong>${renderInline(value.slice(index + 2, endIndex))}</strong>`;
-        index = endIndex + 2;
-        continue;
-      }
-    }
-
-    if (value[index] === "*") {
-      const endIndex = value.indexOf("*", index + 1);
-      if (endIndex > index + 1) {
-        rendered += `<em>${renderInline(value.slice(index + 1, endIndex))}</em>`;
-        index = endIndex + 1;
-        continue;
-      }
-    }
-
-    if (value[index] === "[") {
-      const labelEnd = value.indexOf("](", index + 1);
-      if (labelEnd > index + 1) {
-        const hrefEnd = findClosingParen(value, labelEnd + 2);
-        if (hrefEnd > labelEnd + 2) {
-          const label = value.slice(index + 1, labelEnd);
-          const href = value.slice(labelEnd + 2, hrefEnd);
-          if (isSafeLinkUrl(href)) {
-            const target = href.startsWith("mailto:") ? "" : " target=\"_blank\" rel=\"noopener\"";
-            rendered += `<a class="copy-link" href="${escapeHtml(href)}"${target}>${renderInline(label)}</a>`;
-          } else {
-            rendered += escapeHtml(value.slice(index, hrefEnd + 1));
-          }
-          index = hrefEnd + 1;
-          continue;
-        }
-      }
-    }
-
-    const nextSpecial = ["**", "*", "["]
-      .map((token) => value.indexOf(token, index + 1))
-      .filter((candidate) => candidate !== -1)
-      .sort((left, right) => left - right)[0];
-    const endIndex = nextSpecial ?? value.length;
-    rendered += escapeHtml(value.slice(index, endIndex));
-    index = endIndex;
-  }
-
-  return rendered;
-}
-
-function renderCopy(value) {
-  return value.split(/\r?\n/).map(renderInline).join("<br>");
 }
 
 function readCopyBlocks(markdown) {
@@ -592,10 +541,14 @@ function buildAgentPrompt({ deck, userPrompt, scope, manifest }) {
   const selectedBlock = scope?.blockId
     ? manifest.blocks.find((block) => block.id === scope.blockId)
     : null;
-  const currentSlide = selectedBlock
-    ? manifest.slides.find((slide) => slide.id === selectedBlock.slideId)
-    : scope?.slideId
-      ? manifest.slides.find((slide) => slide.id === scope.slideId)
+  const currentSlide = scope?.slideId
+    ? manifest.slides.find((slide) => slide.id === scope.slideId)
+    : selectedBlock
+      ? manifest.slides.find((slide) => slide.id === selectedBlock.slideId)
+      : null;
+  const selectedBlockSlide =
+    selectedBlock && selectedBlock.slideId !== currentSlide?.id
+      ? manifest.slides.find((slide) => slide.id === selectedBlock.slideId)
       : null;
   const slideBlocks = currentSlide?.blocks
     .map((block) => `- ${block.id}: ${JSON.stringify(block.text)}`)
@@ -610,7 +563,11 @@ Scope:
 - Deck folder: ${deck.id}
 - Deck path: ${deck.path}
 - Current slide: ${currentSlide?.id || "(not specified)"}
+- Current slide index: ${currentSlide?.index || "(not specified)"}
+- Current slide kind: ${currentSlide?.kind || "(not specified)"}
+- Current slide hidden: ${currentSlide ? String(currentSlide.hidden) : "(not specified)"}
 - Selected block: ${selectedBlock?.id || "(not specified)"}
+- Selected block slide: ${selectedBlockSlide?.id || selectedBlock?.slideId || "(not specified)"}
 
 Current slide copy blocks:
 ${slideBlocks}
@@ -638,25 +595,134 @@ Rules:
 When finished, summarize what changed and mention validation results.`;
 }
 
-function publicJob(job) {
+function publicAgentThread(thread) {
   return {
-    id: job.id,
-    deckId: job.deckId,
-    status: job.status,
-    prompt: job.prompt,
-    scope: job.scope,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    exitCode: job.exitCode,
-    stdout: job.stdout,
-    stderr: job.stderr,
-    validation: job.validation,
-    diff: job.diff,
-    error: job.error
+    id: thread.id,
+    codexThreadId: thread.codexThreadId,
+    deckId: thread.deckId,
+    status: thread.status,
+    mode: thread.mode,
+    scope: thread.scope,
+    messages: thread.messages,
+    plan: thread.plan,
+    activities: thread.activities,
+    validation: thread.validation,
+    diff: thread.diff,
+    error: thread.error,
+    createdAt: thread.createdAt,
+    updatedAt: thread.updatedAt
   };
 }
 
-async function startAgentJob(deck, body) {
+function broadcastAgentThread(thread, eventName = "agent-thread") {
+  const payload = publicAgentThread(thread);
+  for (const client of thread.clients) {
+    sendDeckEvent(client, eventName, payload);
+  }
+}
+
+function upsertActivity(thread, item) {
+  const existingIndex = thread.activities.findIndex((activity) => activity.id === item.id);
+  const baseActivity = thread.activities[existingIndex] ?? {
+    id: item.id,
+    type: item.type,
+    title: item.type,
+    detail: "",
+    status: "in_progress",
+    output: "",
+    changes: []
+  };
+  const activity = { ...baseActivity, type: item.type };
+
+  if (item.type === "command_execution") {
+    activity.title = "Command";
+    activity.detail = item.command;
+    activity.status = item.status;
+    activity.output = item.aggregated_output || "";
+    activity.exitCode = item.exit_code ?? null;
+  } else if (item.type === "file_change") {
+    activity.title = "File changes";
+    activity.detail = item.changes.map((change) => `${change.kind}: ${change.path}`).join("\n");
+    activity.status = item.status;
+    activity.changes = item.changes;
+  } else if (item.type === "mcp_tool_call") {
+    activity.title = "MCP tool";
+    activity.detail = `${item.server}.${item.tool}`;
+    activity.status = item.status;
+  } else if (item.type === "web_search") {
+    activity.title = "Web search";
+    activity.detail = item.query;
+    activity.status = "completed";
+  } else if (item.type === "reasoning") {
+    activity.title = "Reasoning";
+    activity.detail = item.text;
+    activity.status = "completed";
+  } else if (item.type === "error") {
+    activity.title = "Error";
+    activity.detail = item.message;
+    activity.status = "failed";
+  }
+
+  if (existingIndex >= 0) {
+    thread.activities[existingIndex] = activity;
+  } else {
+    thread.activities.push(activity);
+  }
+}
+
+function updateThreadFromItem(thread, item) {
+  if (item.type === "agent_message") {
+    const assistantMessage = thread.messages.find((message) => message.id === thread.activeAssistantMessageId);
+    if (assistantMessage) {
+      assistantMessage.content = item.text;
+      assistantMessage.status = thread.status === "running" ? "running" : "complete";
+    }
+    return;
+  }
+
+  if (item.type === "todo_list") {
+    thread.plan = item.items.map((todo) => ({
+      step: todo.text,
+      status: todo.completed ? "completed" : "pending"
+    }));
+    return;
+  }
+
+  upsertActivity(thread, item);
+}
+
+function createAgentThread(deck, body = {}) {
+  const now = new Date().toISOString();
+  const thread = {
+    id: randomUUID(),
+    codexThreadId: null,
+    deckId: deck.id,
+    mode: body.mode === "plan" ? "plan" : "chat",
+    scope: body.scope || {},
+    status: "idle",
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+    plan: [],
+    activities: [],
+    validation: null,
+    diff: "",
+    error: null,
+    clients: new Set(),
+    activeAssistantMessageId: null,
+    codexThread: codex.startThread({
+      workingDirectory: deck.root,
+      additionalDirectories: [deck.path],
+      sandboxMode: "workspace-write",
+      skipGitRepoCheck: true,
+      approvalPolicy: "never"
+    })
+  };
+  agentThreads.set(thread.id, thread);
+  return thread;
+}
+
+async function startAgentTurn(deck, thread, body) {
   const manifest = await readDeckManifest(deck);
   const userPrompt = String(body?.prompt || "").trim();
   if (!userPrompt) {
@@ -664,85 +730,89 @@ async function startAgentJob(deck, body) {
     error.status = 400;
     throw error;
   }
+  if (thread.status === "running") {
+    const error = new Error("Agent thread is already running.");
+    error.status = 409;
+    throw error;
+  }
 
-  const job = {
+  const now = new Date().toISOString();
+  const scope = body?.scope || thread.scope || {};
+  const mode = body?.mode === "plan" ? "plan" : "chat";
+  const assistantMessageId = randomUUID();
+  thread.mode = mode;
+  thread.scope = scope;
+  thread.status = "running";
+  thread.error = null;
+  thread.validation = null;
+  thread.diff = "";
+  thread.plan = [];
+  thread.activities = [];
+  thread.updatedAt = now;
+  thread.activeAssistantMessageId = assistantMessageId;
+  thread.messages.push({
     id: randomUUID(),
-    deckId: deck.id,
-    prompt: userPrompt,
-    scope: body?.scope || {},
-    status: "running",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    exitCode: null,
-    stdout: "",
-    stderr: "",
-    validation: null,
-    diff: "",
-    error: null
-  };
-  jobs.set(job.id, job);
+    role: "user",
+    content: userPrompt,
+    createdAt: now,
+    status: "complete"
+  });
+  thread.messages.push({
+    id: assistantMessageId,
+    role: "assistant",
+    content: "",
+    createdAt: now,
+    status: "running"
+  });
+  broadcastAgentThread(thread);
 
   const agentPrompt = buildAgentPrompt({
     deck,
-    userPrompt,
-    scope: job.scope,
+    userPrompt:
+      mode === "plan"
+        ? `${userPrompt}\n\nPlan mode: inspect the deck context and produce a concise implementation plan. Do not edit files in this turn.`
+        : userPrompt,
+    scope,
     manifest
   });
 
-  const child = spawn(
-    "codex",
-    [
-      "--ask-for-approval",
-      "never",
-      "exec",
-      "-C",
-      deck.root,
-      "--add-dir",
-      deck.path,
-      "--sandbox",
-      "workspace-write",
-      "--skip-git-repo-check",
-      "--color",
-      "never",
-      "-"
-    ],
-    {
-      cwd: deck.root,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+  void (async () => {
+    try {
+      const streamed = await thread.codexThread.runStreamed(agentPrompt);
+      for await (const event of streamed.events) {
+        if (event.type === "thread.started") {
+          thread.codexThreadId = event.thread_id;
+        } else if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+          updateThreadFromItem(thread, event.item);
+        } else if (event.type === "turn.failed") {
+          thread.status = "failed";
+          thread.error = event.error.message;
+        } else if (event.type === "error") {
+          thread.status = "failed";
+          thread.error = event.message;
+        }
+        thread.updatedAt = new Date().toISOString();
+        broadcastAgentThread(thread);
+      }
+
+      const assistantMessage = thread.messages.find((message) => message.id === assistantMessageId);
+      if (assistantMessage) assistantMessage.status = thread.status === "failed" ? "failed" : "complete";
+      thread.validation = mode === "plan" ? { skipped: true, ok: true, stdout: "", stderr: "" } : await runDeckCheck(deck);
+      thread.diff = await readDeckDiff(deck);
+      thread.status = thread.status === "failed" ? "failed" : "completed";
+      thread.updatedAt = new Date().toISOString();
+      broadcastAgentThread(thread, "agent-thread-completed");
+    } catch (error) {
+      const assistantMessage = thread.messages.find((message) => message.id === assistantMessageId);
+      if (assistantMessage) assistantMessage.status = "failed";
+      thread.status = "failed";
+      thread.error = error instanceof Error ? error.message : String(error);
+      thread.validation = await runDeckCheck(deck);
+      thread.diff = await readDeckDiff(deck);
+      thread.updatedAt = new Date().toISOString();
+      broadcastAgentThread(thread, "agent-thread-failed");
     }
-  );
-
-  child.stdin.write(agentPrompt);
-  child.stdin.end();
-
-  child.stdout.on("data", (chunk) => {
-    job.stdout += chunk.toString();
-    job.updatedAt = new Date().toISOString();
-  });
-
-  child.stderr.on("data", (chunk) => {
-    job.stderr += chunk.toString();
-    job.updatedAt = new Date().toISOString();
-  });
-
-  child.on("error", async (error) => {
-    job.status = "failed";
-    job.error = error.message;
-    job.updatedAt = new Date().toISOString();
-    job.validation = await runDeckCheck(deck);
-    job.diff = await readDeckDiff(deck);
-  });
-
-  child.on("close", async (code) => {
-    job.exitCode = code;
-    job.validation = await runDeckCheck(deck);
-    job.diff = await readDeckDiff(deck);
-    job.status = code === 0 ? "completed" : "failed";
-    job.updatedAt = new Date().toISOString();
-  });
-
-  return job;
+  })();
 }
 
 async function updateCopyMarkdown(deck, blockId, text) {
@@ -924,7 +994,7 @@ async function setSlideVisibility(deck, slideId, hidden) {
   return { slideId, hidden };
 }
 
-async function moveSlide(deck, slideId, direction) {
+async function moveSlide(deck, slideId, moveRequest) {
   const htmlPath = path.join(deck.path, "index.html");
   const html = await fs.readFile(htmlPath, "utf8");
   const sections = getSlideSections(html);
@@ -935,6 +1005,37 @@ async function moveSlide(deck, slideId, direction) {
     throw error;
   }
 
+  const targetIndex =
+    typeof moveRequest === "object" && moveRequest !== null && Number.isFinite(moveRequest.targetIndex)
+      ? Number(moveRequest.targetIndex) - 1
+      : null;
+  if (targetIndex !== null) {
+    if (targetIndex < 0 || targetIndex >= sections.length) {
+      const error = new Error(`Unsupported move target index: ${moveRequest.targetIndex}`);
+      error.status = 400;
+      throw error;
+    }
+    if (targetIndex === index) {
+      return { slideId, moved: false };
+    }
+
+    const reordered = [...sections];
+    const [moved] = reordered.splice(index, 1);
+    reordered.splice(targetIndex, 0, { ...moved, html: upsertSlideId(moved.html, slideId) });
+    const firstStart = sections[0].start;
+    const lastEnd = sections.at(-1).end;
+    const nextSlidesHtml = reordered.map((candidate) => upsertSlideId(candidate.html, candidate.id)).join("\n");
+    const nextHtml = `${html.slice(0, firstStart)}${nextSlidesHtml}${html.slice(lastEnd)}`;
+    await fs.writeFile(htmlPath, nextHtml, "utf8");
+    return { slideId, moved: true };
+  }
+
+  const direction =
+    typeof moveRequest === "string"
+      ? moveRequest
+      : typeof moveRequest === "object" && moveRequest !== null
+        ? moveRequest.direction
+        : moveRequest;
   const offset = direction === "up" ? -1 : direction === "down" ? 1 : 0;
   if (!offset) {
     const error = new Error(`Unsupported move direction: ${direction}`);
@@ -942,17 +1043,17 @@ async function moveSlide(deck, slideId, direction) {
     throw error;
   }
 
-  const targetIndex = index + offset;
-  if (targetIndex < 0 || targetIndex >= sections.length) {
+  const directionalTargetIndex = index + offset;
+  if (directionalTargetIndex < 0 || directionalTargetIndex >= sections.length) {
     return { slideId, moved: false };
   }
 
   const reordered = [...sections];
   const [moved] = reordered.splice(index, 1);
-  reordered.splice(targetIndex, 0, moved);
+  reordered.splice(directionalTargetIndex, 0, { ...moved, html: upsertSlideId(moved.html, slideId) });
   const firstStart = sections[0].start;
   const lastEnd = sections.at(-1).end;
-  const nextSlidesHtml = reordered.map((candidate) => candidate.html).join("\n");
+  const nextSlidesHtml = reordered.map((candidate) => upsertSlideId(candidate.html, candidate.id)).join("\n");
   const nextHtml = `${html.slice(0, firstStart)}${nextSlidesHtml}${html.slice(lastEnd)}`;
   await fs.writeFile(htmlPath, nextHtml, "utf8");
   return { slideId, moved: true };
@@ -1070,32 +1171,80 @@ app.put("/api/decks/:deckId/slides/:slideId/visibility", async (req, res, next) 
 app.post("/api/decks/:deckId/slides/:slideId/move", async (req, res, next) => {
   try {
     const deck = await getDeck(req.params.deckId);
-    const result = await moveSlide(deck, req.params.slideId, req.body?.direction);
+    const result = await moveSlide(deck, req.params.slideId, req.body);
     res.json({ ok: true, ...result, manifest: await readDeckManifest(deck) });
   } catch (error) {
     next(error);
   }
 });
 
-app.post("/api/decks/:deckId/agent-jobs", async (req, res, next) => {
+app.post("/api/decks/:deckId/agent-threads", async (req, res, next) => {
   try {
     const deck = await getDeck(req.params.deckId);
-    const job = await startAgentJob(deck, req.body);
-    res.status(202).json({ ok: true, job: publicJob(job) });
+    const thread = createAgentThread(deck, req.body);
+    res.status(201).json({ ok: true, thread: publicAgentThread(thread) });
   } catch (error) {
     next(error);
   }
 });
 
-app.get("/api/agent-jobs/:jobId", (req, res, next) => {
+app.get("/api/agent-threads/:threadId", (req, res, next) => {
   try {
-    const job = jobs.get(req.params.jobId);
-    if (!job) {
-      const error = new Error(`Unknown job: ${req.params.jobId}`);
+    const thread = agentThreads.get(req.params.threadId);
+    if (!thread) {
+      const error = new Error(`Unknown agent thread: ${req.params.threadId}`);
       error.status = 404;
       throw error;
     }
-    res.json({ ok: true, job: publicJob(job) });
+    res.json({ ok: true, thread: publicAgentThread(thread) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/agent-threads/:threadId/turns", async (req, res, next) => {
+  try {
+    const thread = agentThreads.get(req.params.threadId);
+    if (!thread) {
+      const error = new Error(`Unknown agent thread: ${req.params.threadId}`);
+      error.status = 404;
+      throw error;
+    }
+    const deck = await getDeck(thread.deckId);
+    await startAgentTurn(deck, thread, req.body);
+    res.status(202).json({ ok: true, thread: publicAgentThread(thread) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/agent-threads/:threadId/events", (req, res, next) => {
+  try {
+    const thread = agentThreads.get(req.params.threadId);
+    if (!thread) {
+      const error = new Error(`Unknown agent thread: ${req.params.threadId}`);
+      error.status = 404;
+      throw error;
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+
+    sendDeckEvent(res, "agent-thread", publicAgentThread(thread));
+    thread.clients.add(res);
+    const heartbeat = setInterval(() => {
+      sendDeckEvent(res, "agent-thread-heartbeat", {
+        threadId: thread.id,
+        at: new Date().toISOString()
+      });
+    }, 30000);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      thread.clients.delete(res);
+    });
   } catch (error) {
     next(error);
   }
@@ -1173,6 +1322,7 @@ export {
   appendCopyMarkdownBlocks,
   createUniqueId,
   duplicateSlide,
+  buildAgentPrompt,
   getSlideSections,
   insertSlideAfter,
   moveSlide,

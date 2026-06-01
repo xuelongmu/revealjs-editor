@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   duplicateSlide,
+  buildAgentPrompt,
   insertSlideAfter,
   moveSlide,
   parseManifest,
@@ -59,6 +60,14 @@ test("renderCopy supports the editor markdown subset safely", () => {
     renderCopy("A **bold** [link](https://example.com)\nNext"),
     'A <strong>bold</strong> <a class="copy-link" href="https://example.com" target="_blank" rel="noopener">link</a><br>Next'
   );
+  assert.equal(
+    renderCopy("- One\n- **Two**\n- `Three`"),
+    '<ul class="copy-list"><li>One</li><li><strong>Two</strong></li><li><code>Three</code></li></ul>'
+  );
+  assert.equal(
+    renderCopy("1. First\n2. ~~Second~~"),
+    '<ol class="copy-list"><li>First</li><li><del>Second</del></li></ol>'
+  );
   assert.equal(renderCopy("[bad](javascript:alert(1))"), "[bad](javascript:alert(1))");
 });
 
@@ -69,6 +78,10 @@ test("updateHtmlBlock and updateHtmlBlockStyle mutate fixture HTML", async (t) =
   await updateHtmlBlock(deck, "s01.body", "Updated **body**.");
   let html = await fs.readFile(path.join(deck.path, "index.html"), "utf8");
   assert.match(html, /Updated <strong>body<\/strong>\./);
+
+  await updateHtmlBlock(deck, "s01.body", "- Partner workshops\n- Community access");
+  html = await fs.readFile(path.join(deck.path, "index.html"), "utf8");
+  assert.match(html, /<ul class="copy-list"><li>Partner workshops<\/li><li>Community access<\/li><\/ul>/);
 
   await updateHtmlBlockStyle(deck, "s01.title", { tagName: "h2", className: "hero-title" });
   html = await fs.readFile(path.join(deck.path, "index.html"), "utf8");
@@ -113,10 +126,48 @@ test("structural slide edits duplicate, insert, hide, and reorder", async (t) =>
   html = await fs.readFile(path.join(deck.path, "index.html"), "utf8");
   manifest = parseManifest(html);
   assert.deepEqual(manifest.slides.map((slide) => slide.id), ["s01", "new-slide", "s01-copy"]);
+
+  await moveSlide(deck, "s01", { targetIndex: 3 });
+  html = await fs.readFile(path.join(deck.path, "index.html"), "utf8");
+  manifest = parseManifest(html);
+  assert.deepEqual(manifest.slides.map((slide) => slide.id), ["new-slide", "s01-copy", "s01"]);
 });
 
 test("watcher ignores noisy paths", () => {
   assert.equal(shouldIgnoreWatchEvent(".git/index.lock"), true);
   assert.equal(shouldIgnoreWatchEvent("node_modules/pkg/index.js"), true);
   assert.equal(shouldIgnoreWatchEvent("deck/index.html"), false);
+});
+
+test("agent prompt uses explicit slide scope as current slide context", () => {
+  const html = `
+    <section data-slide-id="s01" data-slide-kind="title">
+      <h1><!-- copy:s01.title -->Title<!-- /copy --></h1>
+    </section>
+    <section data-slide-id="s02" data-slide-kind="details">
+      <p><!-- copy:s02.body -->Details<!-- /copy --></p>
+    </section>
+  `;
+  const manifest = parseManifest(html);
+  const prompt = buildAgentPrompt({
+    deck: {
+      id: "basic-deck",
+      path: "C:\\decks\\basic-deck",
+      root: "C:\\decks"
+    },
+    userPrompt: "Tighten the current slide.",
+    scope: {
+      blockId: "s01.title",
+      slideId: "s02"
+    },
+    manifest
+  });
+
+  assert.match(prompt, /- Current slide: s02/);
+  assert.match(prompt, /- Current slide index: 2/);
+  assert.match(prompt, /- Current slide kind: details/);
+  assert.match(prompt, /- Selected block: s01\.title/);
+  assert.match(prompt, /- Selected block slide: s01/);
+  assert.match(prompt, /- s02\.body: "Details"/);
+  assert.doesNotMatch(prompt, /- s01\.title: "Title"/);
 });

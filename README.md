@@ -99,7 +99,7 @@ If a deck does not have `copy.md`, text saves fall back to replacing the matchin
 
 ## Editing Flow
 
-1. Choose a workspace folder with `Browse`, or paste a workspace path and click `Open`.
+1. Choose a workspace folder with `Browse`, or paste a workspace path and press `Enter`.
 2. Select a deck in the sidebar.
 3. Hover editable text in the slide preview. Normal mode shows highlight only on hover.
 4. Click an editable block. This enters edit mode and selects the block.
@@ -111,9 +111,9 @@ The sidebar also supports:
 
 - recently opened workspaces
 - slide navigation, including hidden slides
-- structural slide actions: duplicate, insert after, hide/show, move up, move down
+- slide list controls for hide/show and drag reordering
 - text style selection based on CSS styles found in the current deck
-- bold and italic markdown insertion
+- bold, italic, bullet list, and numbered list markdown insertion
 - markdown link insertion
 - Codex prompted edits
 
@@ -208,7 +208,7 @@ GET  /api/decks/:deckId/events
 ## Gotchas
 
 - Copy block IDs must be stable and unique. Duplicate or missing `copy:` markers make block targeting unreliable.
-- The inline renderer only supports a small markdown subset: `**bold**`, `*italic*`, and `[label](url)` for safe `http`, `https`, and `mailto` links.
+- The presentation markdown renderer is intentionally small: `**bold**`, `*italic*`, `~~strike~~`, inline code, safe links, unordered lists, ordered lists, and paragraph breaks.
 - Direct in-slide editing is text-first. Rich formatting is best applied from the sidebar because markdown syntax is the durable source form.
 - File watching uses `fs.watch`, which can coalesce events or emit more than once on Windows. The frontend debounces watcher events and ignores its own saves for a short window.
 - Any explicit iframe reload loses DOM selection, so most edit paths patch the preview in place.
