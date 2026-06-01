@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  discoverDecks,
   duplicateSlide,
   buildAgentPrompt,
+  buildNativeFolderPickerScript,
   insertSlideAfter,
   moveSlide,
   parseManifest,
@@ -137,6 +139,52 @@ test("watcher ignores noisy paths", () => {
   assert.equal(shouldIgnoreWatchEvent(".git/index.lock"), true);
   assert.equal(shouldIgnoreWatchEvent("node_modules/pkg/index.js"), true);
   assert.equal(shouldIgnoreWatchEvent("deck/index.html"), false);
+});
+
+test("discoverDecks includes workspace roots that are deck folders", async (t) => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "revealjs-editor-roots-"));
+  t.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+
+  const directDeck = path.join(tempRoot, "direct-deck");
+  const nestedWorkspace = path.join(tempRoot, "workspace");
+  const nestedDeck = path.join(nestedWorkspace, "nested-deck");
+
+  await fs.mkdir(directDeck, { recursive: true });
+  await fs.writeFile(path.join(directDeck, "index.html"), "<section>Direct</section>");
+  await fs.mkdir(nestedDeck, { recursive: true });
+  await fs.writeFile(path.join(nestedDeck, "index.html"), "<section>Nested</section>");
+
+  const decks = await discoverDecks([directDeck, nestedWorkspace]);
+
+  assert.deepEqual(
+    decks.map((deck) => ({
+      id: deck.id,
+      path: deck.path,
+      root: deck.root
+    })),
+    [
+      {
+        id: "direct-deck",
+        path: directDeck,
+        root: tempRoot
+      },
+      {
+        id: "nested-deck",
+        path: nestedDeck,
+        root: nestedWorkspace
+      }
+    ]
+  );
+});
+
+test("workspace picker script uses the modern native folder dialog", () => {
+  const script = buildNativeFolderPickerScript("C:\\Decks\\Apostrophe's Decks");
+
+  assert.match(script, /IFileOpenDialog/);
+  assert.match(script, /FOS_PICKFOLDERS/);
+  assert.match(script, /Select a RevealJS deck workspace/);
+  assert.doesNotMatch(script, /FolderBrowserDialog/);
+  assert.match(script, /C:\\Decks\\Apostrophe''s Decks/);
 });
 
 test("agent prompt uses explicit slide scope as current slide context", () => {

@@ -69,6 +69,21 @@ async function pathExists(filePath) {
   }
 }
 
+async function isDeckDirectory(directoryPath) {
+  const stat = await fs.stat(path.join(directoryPath, "index.html")).catch(() => null);
+  return Boolean(stat?.isFile());
+}
+
+function createDeckSummary(deckPath, rootPath = path.dirname(deckPath)) {
+  const deckName = path.basename(deckPath);
+  return {
+    id: deckName,
+    name: deckName,
+    path: deckPath,
+    root: rootPath
+  };
+}
+
 function shouldIgnoreWatchEvent(filename = "") {
   const normalized = String(filename).replaceAll("\\", "/");
   return (
@@ -88,6 +103,113 @@ function sendDeckEvent(client, eventName, payload) {
 
 function quotePowerShellString(value) {
   return `'${String(value || "").replace(/'/g, "''")}'`;
+}
+
+function buildNativeFolderPickerScript(initialDirectory) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "Add-Type -TypeDefinition @'",
+    "using System;",
+    "using System.IO;",
+    "using System.Runtime.InteropServices;",
+    "",
+    "namespace RevealJsEditor {",
+    "  [ComImport]",
+    "  [Guid(\"DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7\")]",
+    "  internal class FileOpenDialogCom { }",
+    "",
+    "  [ComImport]",
+    "  [Guid(\"42f85136-db7e-439c-85f1-e4075d135fc8\")]",
+    "  [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]",
+    "  internal interface IFileOpenDialog {",
+    "    [PreserveSig] int Show(IntPtr parent);",
+    "    void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);",
+    "    void SetFileTypeIndex(uint iFileType);",
+    "    void GetFileTypeIndex(out uint piFileType);",
+    "    void Advise(IntPtr pfde, out uint pdwCookie);",
+    "    void Unadvise(uint dwCookie);",
+    "    void SetOptions(uint fos);",
+    "    void GetOptions(out uint pfos);",
+    "    void SetDefaultFolder(IShellItem psi);",
+    "    void SetFolder(IShellItem psi);",
+    "    void GetFolder(out IShellItem ppsi);",
+    "    void GetCurrentSelection(out IShellItem ppsi);",
+    "    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);",
+    "    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);",
+    "    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);",
+    "    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);",
+    "    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);",
+    "    void GetResult(out IShellItem ppsi);",
+    "    void AddPlace(IShellItem psi, int fdap);",
+    "    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);",
+    "    void Close(int hr);",
+    "    void SetClientGuid(ref Guid guid);",
+    "    void ClearClientData();",
+    "    void SetFilter(IntPtr pFilter);",
+    "    void GetResults(out IntPtr ppenum);",
+    "    void GetSelectedItems(out IntPtr ppsai);",
+    "  }",
+    "",
+    "  [ComImport]",
+    "  [Guid(\"43826d1e-e718-42ee-bc55-a1e261c37bfe\")]",
+    "  [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]",
+    "  internal interface IShellItem {",
+    "    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);",
+    "    void GetParent(out IShellItem ppsi);",
+    "    void GetDisplayName(uint sigdnName, out IntPtr ppszName);",
+    "    void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);",
+    "    void Compare(IShellItem psi, uint hint, out int piOrder);",
+    "  }",
+    "",
+    "  public static class NativeFolderPicker {",
+    "    private const uint FOS_PICKFOLDERS = 0x00000020;",
+    "    private const uint FOS_FORCEFILESYSTEM = 0x00000040;",
+    "    private const uint FOS_PATHMUSTEXIST = 0x00000800;",
+    "    private const uint SIGDN_FILESYSPATH = 0x80058000;",
+    "    private const int HRESULT_CANCELLED = unchecked((int)0x800704C7);",
+    "",
+    "    [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode, PreserveSig = false)]",
+    "    private static extern void SHCreateItemFromParsingName(",
+    "      [MarshalAs(UnmanagedType.LPWStr)] string pszPath,",
+    "      IntPtr pbc,",
+    "      ref Guid riid,",
+    "      out IShellItem ppv",
+    "    );",
+    "",
+    "    public static string Pick(string initialDirectory) {",
+    "      var dialog = (IFileOpenDialog)new FileOpenDialogCom();",
+    "      uint options;",
+    "      dialog.GetOptions(out options);",
+    "      dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);",
+    "      dialog.SetTitle(\"Select a RevealJS deck workspace\");",
+    "      dialog.SetOkButtonLabel(\"Open\");",
+    "",
+    "      if (!string.IsNullOrWhiteSpace(initialDirectory) && Directory.Exists(initialDirectory)) {",
+    "        var shellItemGuid = new Guid(\"43826d1e-e718-42ee-bc55-a1e261c37bfe\");",
+    "        IShellItem initialItem;",
+    "        SHCreateItemFromParsingName(initialDirectory, IntPtr.Zero, ref shellItemGuid, out initialItem);",
+    "        dialog.SetFolder(initialItem);",
+    "      }",
+    "",
+    "      var result = dialog.Show(IntPtr.Zero);",
+    "      if (result == HRESULT_CANCELLED) return string.Empty;",
+    "      if (result < 0) Marshal.ThrowExceptionForHR(result);",
+    "",
+    "      IShellItem item;",
+    "      dialog.GetResult(out item);",
+    "      IntPtr pathPointer;",
+    "      item.GetDisplayName(SIGDN_FILESYSPATH, out pathPointer);",
+    "      try {",
+    "        return Marshal.PtrToStringUni(pathPointer) ?? string.Empty;",
+    "      } finally {",
+    "        if (pathPointer != IntPtr.Zero) Marshal.FreeCoTaskMem(pathPointer);",
+    "      }",
+    "    }",
+    "  }",
+    "}",
+    "'@",
+    `[Console]::Out.Write([RevealJsEditor.NativeFolderPicker]::Pick(${quotePowerShellString(initialDirectory)}))`
+  ].join("\n");
 }
 
 function closeDeckWatchers() {
@@ -131,7 +253,7 @@ async function setDeckRoots(nextRoots) {
 
 async function pickWorkspaceDirectory() {
   const initialDirectory = deckRoots[0] || process.cwd();
-  const script = [
+  const openFolderDialogScript = [
     "Add-Type -AssemblyName PresentationFramework",
     "$dialog = [Microsoft.Win32.OpenFolderDialog]::new()",
     "$dialog.Title = 'Select a RevealJS deck workspace'",
@@ -140,40 +262,32 @@ async function pickWorkspaceDirectory() {
     "  [Console]::Out.Write($dialog.FolderName)",
     "}"
   ].join("\n");
+  const nativeFolderPickerScript = buildNativeFolderPickerScript(initialDirectory);
 
-  let result;
-  try {
-    result = await execFileAsync(
-      "pwsh",
-      ["-NoProfile", "-STA", "-Command", script],
-      {
-        cwd: process.cwd(),
-        windowsHide: false,
-        timeout: 1000 * 60 * 10
-      }
-    );
-  } catch (error) {
-    const fallbackScript = [
-      "Add-Type -AssemblyName System.Windows.Forms",
-      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
-      "$dialog.Description = 'Select a RevealJS deck workspace'",
-      "$dialog.ShowNewFolderButton = $false",
-      `if ([System.IO.Directory]::Exists(${quotePowerShellString(initialDirectory)})) { $dialog.SelectedPath = ${quotePowerShellString(initialDirectory)} }`,
-      "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"
-    ].join("\n");
-
-    result = await execFileAsync(
-      "powershell",
-      ["-NoProfile", "-STA", "-Command", fallbackScript],
-      {
-        cwd: process.cwd(),
-        windowsHide: false,
-        timeout: 1000 * 60 * 10
-      }
-    );
+  const attempts = [
+    ["pwsh", openFolderDialogScript],
+    ["powershell", nativeFolderPickerScript],
+    ["pwsh", nativeFolderPickerScript]
+  ];
+  let lastError;
+  for (const [executable, script] of attempts) {
+    try {
+      const result = await execFileAsync(
+        executable,
+        ["-NoProfile", "-STA", "-Command", script],
+        {
+          cwd: process.cwd(),
+          windowsHide: false,
+          timeout: 1000 * 60 * 10
+        }
+      );
+      return result.stdout.trim();
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  return result.stdout.trim();
+  throw lastError;
 }
 
 function ensureDeckWatcher(deck) {
@@ -221,28 +335,27 @@ function ensureDeckWatcher(deck) {
   return state;
 }
 
-async function discoverDecks() {
-  const decks = [];
+async function discoverDecks(roots = deckRoots) {
+  const decksByPath = new Map();
 
-  for (const root of deckRoots) {
+  for (const root of roots) {
     if (!(await pathExists(root))) continue;
+
+    if (await isDeckDirectory(root)) {
+      decksByPath.set(path.resolve(root), createDeckSummary(root));
+    }
 
     const entries = await fs.readdir(root, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const deckPath = path.join(root, entry.name);
-      const htmlPath = path.join(deckPath, "index.html");
-      if (await pathExists(htmlPath)) {
-        decks.push({
-          id: entry.name,
-          name: entry.name,
-          path: deckPath,
-          root
-        });
+      if (await isDeckDirectory(deckPath)) {
+        decksByPath.set(path.resolve(deckPath), createDeckSummary(deckPath, root));
       }
     }
   }
 
+  const decks = Array.from(decksByPath.values());
   return decks.sort((left, right) => left.name.localeCompare(right.name));
 }
 
@@ -1321,8 +1434,10 @@ app.use((error, _req, res, _next) => {
 export {
   appendCopyMarkdownBlocks,
   createUniqueId,
+  discoverDecks,
   duplicateSlide,
   buildAgentPrompt,
+  buildNativeFolderPickerScript,
   getSlideSections,
   insertSlideAfter,
   moveSlide,
